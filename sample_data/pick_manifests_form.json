@@ -1,0 +1,24 @@
+{
+  "key": "WAV-1101",
+  "cohort": "东巷",
+  "day": 2,
+  "received": 3,
+  "revision": 1,
+  "result_day": 5,
+  "outcome": 21.71368,
+  "observed": true,
+  "form": {
+    "批拣单": {
+      "order_lines": 79,
+      "bulky_basis_points": 2200
+    },
+    "班组签到": {
+      "signed_workers": 8,
+      "path_centimetres": 22200
+    },
+    "装车时标": {
+      "merging_orders": 37,
+      "truck_slack_seconds": 5160
+    }
+  }
+}
