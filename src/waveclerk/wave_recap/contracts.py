@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-POLICY_VERSION = 'waveclerk.20261125.v1'
+POLICY_VERSION = 'waveclerk.20261126.v2'
 
 
 @dataclass(frozen=True, slots=True)

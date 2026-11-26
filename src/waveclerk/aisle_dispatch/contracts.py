@@ -1,6 +1,7 @@
 from dataclasses import dataclass, replace
 
 RISK_CUTOFF = 34
+PENDING_REVIEW = '待核'
 
 
 @dataclass(frozen=True, slots=True)

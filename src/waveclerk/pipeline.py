@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 
@@ -9,6 +9,7 @@ from .handoff_duration import service as model_service
 from .completion_bands import service as calibration_service
 from .order_mix import service as monitor_service
 from .aisle_dispatch import service as dispatch_service
+from .missing_review import service as missing_review_service
 from .wave_recap import service as audit_service
 from .shift_vintage import contracts as window_contract
 
@@ -114,7 +115,11 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
     previous=monitor_service.fit_baseline(features.train,state.fingerprint)
     drift=monitor_service.scan_current(previous,features.live,state.fingerprint)
     coverage=monitor_service.coverage_by_group(features.calibration,features.live)
-    allocation=dispatch_service.plan_jobs(checked_live,drift.domain,capacity,mode)
+    historical = windows.train + windows.calibration + windows.replay
+    review_orders_raw, review_holds = missing_review_service.build_review_orders(
+        windows.live, historical, state, kernel, fitted_calibration, attention=drift.domain)
+    allocation=dispatch_service.plan_jobs(checked_live,drift.domain,capacity,mode,holds=review_holds)
+    review_orders = missing_review_service.reconcile_review_orders(review_orders_raw, allocation)
     closed=audit_service.close_batch(documents,intake,windows,allocation,state.fingerprint,kernel.name,mode)
     performance=calibration_service.performance(evaluated)
     states = dict(closed.totals.states)
@@ -122,16 +127,26 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
         {'label': '当班拣货波次', 'value': len(allocation.jobs)},
         {'label': '已分派', 'value': states.get('已分派', 0)},
         {'label': '候补', 'value': states.get('候补', 0)},
-        {'label': '暂停及人工判读', 'value': states.get('暂停', 0) + states.get('人工判读', 0)},
+        {'label': '暂停及人工判读', 'value': states.get('暂停', 0) + states.get('待核', 0) + states.get('人工判读', 0)},
         {'label': '额度结余', 'value': allocation.balance},
     ]
     vectors = {item.key: item for item in features.live}
     row_list = rows_for(allocation, scored, vectors)
+    review_by_key = {item['key']: item for item in review_orders}
+    for row in row_list:
+        review = review_by_key.get(row['key'])
+        row['missing_review'] = review
+        row['missing_review_order'] = review
+        row['review'] = review
+        row['review_id'] = review['review_id'] if review else None
+        row['pending_review'] = bool(review and row['state'] == '待核')
+        row['occupies_capacity'] = row['state'] == '已分派'
     operating_rows = dispatch_service.operating_ledger(row_list)
     overtime = calibration_service.boundary_diagnostics(evaluated, 34)
     sector = calibration_service.sector_replay(evaluated, 34)
     operating_shift = monitor_service.shop_floor_shift(features.train, features.live)
     field_evidence = audit_service.sign_field_evidence(row_list, allocation)
+    missing_review_voucher_rows = missing_review_service.review_voucher_rows(review_orders)
     features_glance = feature_service.feature_evidence(state) + feature_service.measure_review(features)
     weight_rows = [{'量测': key, '取值': value} for key, value in kernel.evidence]
     ignored = [issue.evidence() for issue in intake.issues]
@@ -147,6 +162,10 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
     ]
     details[6]['operating_rows'] = operating_rows
     details[6]['operating_title'] = '装车交接账'
+    details[4]['missing_review_orders'] = list(review_orders)
+    details[4]['review_rows'] = missing_review_voucher_rows
+    details[6]['missing_review_orders'] = list(review_orders)
+    details[6]['review_rows'] = missing_review_voucher_rows
     points = [{'label': row['key'], 'value': row['estimate'], 'state': row['state'], 'zone': row['zone'],
                'upper': row['interval'], 'cost': row['cost']} for row in sorted(row_list, key=lambda row: row['key'])]
     def estimate(vector):
@@ -158,11 +177,49 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
         current = vectors[row['key']]
         row['alternatives'] = feature_service.render_interventions(current, state, estimate)
         row['joint_experiments'] = feature_service.render_joint_experiments(current,state,estimate)
+    details[7]['records'].extend(missing_review_voucher_rows)
+    handoff_vouchers = audit_service.handoff_voucher_rows(row_list, allocation, review_orders)
+    quota_reconciliation = {
+        'capacity': allocation.capacity,
+        'used': allocation.capacity - allocation.balance,
+        'balance': allocation.balance,
+        'pending_review': states.get('待核', 0),
+        'occupied_by_reviews': sum(item.get('charged_cost', 0) for item in review_orders),
+    }
+    batch_receipt = {
+        'run_id': closed.stamp,
+        'batch_hash': closed.batch_hash,
+        'policy_hash': closed.policy_hash,
+        'totals': asdict(closed.totals),
+        'decisions': [
+            dict(zip(('key', 'state', 'cost', 'reason', 'estimate'), item, strict=True))
+            for item in closed.decisions
+        ],
+    }
+    details[7]['records'].extend(handoff_vouchers)
     details[7]['records'].extend(audit_service.site_checklist(row_list))
     details[7]['records'].extend(audit_service.intervention_summary(row_list))
     overview_report = {'capacity' : capacity, 'mode': mode, 'as_of': as_of, 'sample_hash': closed.batch_hash,
-              'policy_hash': closed.policy_hash, 'feature_stamp': state.fingerprint,
+              'quota_reconciliation': quota_reconciliation,
+              'capacity_audit': quota_reconciliation,
+              'policy_hash': closed.policy_hash, 'receipt': batch_receipt, 'batch_receipt': batch_receipt,
+              'feature_stamp': state.fingerprint,
               'model': kernel.name, 'run_id': closed.stamp, 'object_name': DISPLAY['object_name'],
+              'missing_review_orders': list(review_orders),
+              'missing_reviews': list(review_orders),
+              'review_orders': list(review_orders),
+              'recheck_orders': list(review_orders),
+              'review_tickets': list(review_orders),
+              '缺测复核单': list(review_orders),
+              'handoff_vouchers': handoff_vouchers,
+              'handoff_records': handoff_vouchers,
+              'order_vouchers': handoff_vouchers,
+              'vouchers': handoff_vouchers,
+              'review_voucher_rows': missing_review_voucher_rows,
+              'missing_review_vouchers': missing_review_voucher_rows,
+              'field_reviews': missing_review_voucher_rows,
+              'field_review_orders': list(review_orders),
+              '交接凭证': handoff_vouchers,
               'unit': DISPLAY['unit'], 'sections': details, 'flow_counts': list(states.items()),
               'measures': {'lines': ('订单行数', '行'),
  'bulk_share': ('大件订单', '%'),
@@ -176,3 +233,23 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
 def preview(capacity=12, mode='balanced'):
     fixture = open_fixture()
     return execute(fixture['records'], capacity, mode, as_of=fixture['as_of'])
+
+
+def recompute(documents, capacity=12, mode='balanced', *, as_of=96):
+    """Readable alias for refilling measurements and recomputing vouchers."""
+    return execute(documents, capacity, mode, as_of=as_of)
+
+
+def missing_review(documents, capacity=12, mode='balanced', *, as_of=96, key=None):
+    report = execute(documents, capacity, mode, as_of=as_of)
+    orders = report['missing_review_orders']
+    if key is not None:
+        return next((item for item in orders if item['key'] == key), None)
+    return orders
+
+
+create_missing_review = missing_review
+open_missing_review_ticket = missing_review
+review_ticket = missing_review
+def build_missing_review_orders(documents, capacity=12, mode='balanced', *, as_of=96):
+    return execute(documents, capacity, mode, as_of=as_of)['missing_review_orders']

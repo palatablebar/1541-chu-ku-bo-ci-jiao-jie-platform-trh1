@@ -46,20 +46,87 @@ def overview():
 def run_case():
     try:
         posted = request.get_json()
-        if not isinstance(posted, dict) or posted.keys() - {'capacity', 'strategy', 'records', 'as_of'}:
+        if not isinstance(posted, dict) or posted.keys() - {'capacity', 'strategy', 'records', 'as_of', 'key', 'review_key'}:
             raise ValueError('请求字段无效')
         mode = posted.get('strategy', 'balanced')
         capacity, strategy = validate_parameters(posted.get('capacity', 12), mode)
         if 'records' not in posted:
             if 'as_of' in posted:
                 raise ValueError('导入截止日需要同时提交 records')
-            return jsonify(sample(capacity, strategy))
-        as_of = posted.get('as_of', 96)
-        if type(as_of) is not int or not 91 <= as_of <= 3650:
-            raise ValueError('截止日须在第 91 日后')
-        return jsonify(execute(posted['records'], capacity, strategy, as_of=as_of))
+            result = sample(capacity, strategy)
+        else:
+            as_of = posted.get('as_of', 96)
+            if type(as_of) is not int or not 91 <= as_of <= 3650:
+                raise ValueError('截止日须在第 91 日后')
+            result = execute(posted['records'], capacity, strategy, as_of=as_of)
+        key = posted.get('key', posted.get('review_key'))
+        if key is not None:
+            result['review'] = next((item for item in result['missing_review_orders'] if item['key'] == key), None)
+        return jsonify(result)
     except (BadRequest, UnsupportedMediaType):
         return jsonify(code='INVALID_JSON', message='请提交 JSON 对象'), 400
+    except ValueError as issue:
+        return jsonify(code='INVALID_BATCH', message=str(issue)), 422
+
+
+@app.post('/api/waveclerk/review')
+@app.post('/api/waveclerk/reviews')
+@app.post('/api/waveclerk/recheck')
+@app.post('/api/waveclerk/rechecks')
+@app.post('/api/waveclerk/field-review')
+@app.post('/api/waveclerk/missing-review')
+@app.post('/api/waveclerk/missing-reviews')
+@app.post('/api/waveclerk/missing-review-order')
+@app.post('/api/waveclerk/missing-review-orders')
+@app.post('/api/waveclerk/missing_review')
+def missing_review_case():
+    try:
+        posted = request.get_json()
+        if not isinstance(posted, dict):
+            raise ValueError('请提交 JSON 对象')
+        if posted.keys() - {'capacity', 'strategy', 'records', 'as_of', 'key', 'review_key'}:
+            raise ValueError('请求字段无效')
+        mode = posted.get('strategy', 'balanced')
+        capacity, strategy = validate_parameters(posted.get('capacity', 12), mode)
+        if 'records' not in posted:
+            result = sample(capacity, strategy)
+        else:
+            as_of = posted.get('as_of', 96)
+            if type(as_of) is not int or not 91 <= as_of <= 3650:
+                raise ValueError('截止日须在第 91 日后')
+            result = execute(posted['records'], capacity, strategy, as_of=as_of)
+        key = posted.get('key', posted.get('review_key'))
+        orders = result['missing_review_orders']
+        payload = {'run_id': result['run_id'], 'feature_stamp': result['feature_stamp'],
+                   'capacity': result['capacity'], 'mode': result['mode'],
+                   'missing_review_orders': orders, 'handoff_vouchers': result['handoff_vouchers']}
+        if key is not None:
+            payload['review'] = next((item for item in orders if item['key'] == key), None)
+        return jsonify(payload)
+    except (BadRequest, UnsupportedMediaType):
+        return jsonify(code='INVALID_JSON', message='请提交 JSON 对象'), 400
+    except ValueError as issue:
+        return jsonify(code='INVALID_BATCH', message=str(issue)), 422
+
+
+@app.get('/api/waveclerk/missing-review')
+@app.get('/api/waveclerk/missing-reviews')
+@app.get('/api/waveclerk/missing_review')
+def missing_review_sample_case():
+    try:
+        raw = request.args.get('capacity', '12')
+        if not re.fullmatch(r'[0-9]{1,2}', raw):
+            raise ValueError('额度应是 1 到 60 的整数')
+        capacity, strategy = validate_parameters(int(raw), request.args.get('strategy', 'balanced'))
+        result = sample(capacity, strategy)
+        key = request.args.get('key')
+        orders = result['missing_review_orders']
+        payload = {'run_id': result['run_id'], 'feature_stamp': result['feature_stamp'],
+                   'capacity': result['capacity'], 'mode': result['mode'],
+                   'missing_review_orders': orders, 'handoff_vouchers': result['handoff_vouchers']}
+        if key is not None:
+            payload['review'] = next((item for item in orders if item['key'] == key), None)
+        return jsonify(payload)
     except ValueError as issue:
         return jsonify(code='INVALID_BATCH', message=str(issue)), 422
 
@@ -93,6 +160,12 @@ def main():
     runner.add_argument('--strategy', choices=('balanced', 'focus'), default='balanced')
     runner.add_argument('--input', type=Path)
     runner.add_argument('--output', type=Path)
+    reviewer = commands.add_parser('review', help='输出缺测复核试算单')
+    reviewer.add_argument('--capacity', type=int, default=12)
+    reviewer.add_argument('--strategy', choices=('balanced', 'focus'), default='balanced')
+    reviewer.add_argument('--input', type=Path)
+    reviewer.add_argument('--output', type=Path)
+    reviewer.add_argument('--key')
     server = commands.add_parser('serve', help='打开本地工作台')
     server.add_argument('--port', type=int, default=8000)
     args = parser.parse_args()
@@ -108,6 +181,14 @@ def main():
             result = execute(custom['records'], capacity, strategy, as_of=custom.get('as_of', 96))
         else:
             result = sample(capacity, strategy)
+        if args.command == 'review':
+            orders = result['missing_review_orders']
+            if args.key:
+                result = next((item for item in orders if item['key'] == args.key), None)
+                if result is None:
+                    raise ValueError('未找到该单号的缺测复核试算')
+            else:
+                result = orders
     except (ValueError, OSError) as issue:
         parser.error(str(issue))
     output = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False) + '\n'

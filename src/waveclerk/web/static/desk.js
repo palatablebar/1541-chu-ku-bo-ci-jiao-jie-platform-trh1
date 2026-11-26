@@ -73,7 +73,36 @@ function showTables(target, records, options={}) {
     for (const group of groups.values()) target.append(rowsTable(group,Object.keys(group[0]),options));
 }
 
+function renderMissingReview(card, row) {
+    const review = row.missing_review;
+    if (!review) return;
+    card.append(node('h3', '缺测复核单', 'inner-heading'));
+    const summary = {
+        '复核单号': review.review_id,
+        '复核结论': review['复核状态'],
+        '最终处置': review['最终处置'] ?? '—',
+        '原因': review.message,
+        '适用组合数': review.combination_count,
+        '装车缓冲线': review.buffer_line,
+        '完工上沿范围': `${review.min_upper ?? '—'}–${review.max_upper ?? '—'}`,
+        '特征版本': review.feature_stamp
+    };
+    showTables(card, [summary]);
+    if (review.工况?.length) {
+        const scenarios = review.工况.map(item => ({
+            '实测组合': Object.entries(item['实测组合']).map(([key, value]) => `${key}=${value}`).join('，'),
+            '来源单号': item['来源单号'].join('、'),
+            '估计': item['估计'],
+            '区间上沿': item['区间上沿'],
+            '缓冲线侧': item['缓冲线侧'],
+            '命中规则': item['命中规则'].join('、')
+        }));
+        showTables(card, scenarios);
+    }
+}
+
 function renderMeasurements(card, row) {
+    renderMissingReview(card, row);
     const labels = ledger.measures;
     const snapshot = node('dl',undefined,'record-fields');
     for (const [key,value] of Object.entries(row.measurements)) {

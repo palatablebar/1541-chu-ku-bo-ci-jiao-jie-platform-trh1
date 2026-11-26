@@ -1,6 +1,7 @@
 from .operating_ledger import operating_ledger
 from collections import Counter, defaultdict
 from math import exp, isfinite
+from types import SimpleNamespace
 
 from .contracts import RuleNotice, Job, Plan, Policy, RISK_CUTOFF
 from .constraints import WorkOrder, apply_aisle_dispatch
@@ -41,7 +42,7 @@ def confidence_weight(estimate, cutoff):
     return bounded / (1 + bounded)
 
 
-def recommend(assessment, attention, policy):
+def recommend(assessment, attention, policy, hold=None):
     raw = assessment.raw
     data = measures(raw.input_values)
     estimate = assessment.estimate
@@ -54,6 +55,13 @@ def recommend(assessment, attention, policy):
         state = '暂停'
         reason = domain_codes[0].rule_id
         summary = domain_codes[0].meaning
+    elif hold is not None:
+        state = hold.state
+        reason = hold.reason
+        summary = hold.summary
+        extra_hits = tuple(getattr(hold, 'rule_hits', ()) or ())
+        if extra_hits:
+            domain_codes = tuple(dict.fromkeys((*extra_hits, *(item.rule_id for item in domain_codes))))
     elif raw.key in attention or assessment.uncertain:
         state = '人工判读'
         reason = 'OUT_OF_REFERENCE' if raw.key in attention else 'INSUFFICIENT_CALIBRATION'
@@ -66,14 +74,20 @@ def recommend(assessment, attention, policy):
         state = '观察'
         reason = 'BELOW_TRIGGER'
         summary = '保留记录并等待下一次巡查'
+    rule_hits = tuple(item.rule_id for item in domain_codes) if domain_codes and not isinstance(domain_codes[0], str) else tuple(domain_codes)
     return Job(raw.key, raw.cohort, round(estimate, 4), assessment.lower, assessment.upper, cost,
-               state, reason, summary, round(level, 5), tuple(item.rule_id for item in domain_codes))
+               state, reason, summary, round(level, 5), rule_hits)
 
 
-def allocate(assessments, attention, policy):
+def allocate(assessments, attention, policy, holds=None, review_holds=None):
+    holds = holds if holds is not None else review_holds
+    if isinstance(holds, (set, frozenset, tuple, list)):
+        holds = {key: SimpleNamespace(state='待核', reason='MISSING_MEASUREMENT_REVIEW',
+                                      summary='缺测工况尚待现场复核', rule_hits=()) for key in holds}
+    holds = holds or {}
     indexed = {}
     for document in assessments:
-        work = recommend(document,attention,policy)
+        work = recommend(document, attention, policy, holds.get(document.raw.key))
         if work.key in indexed:
             raise ValueError('待裁决单重复登记')
         indexed[work.key] = WorkOrder(work,document)
@@ -108,13 +122,18 @@ def allocate(assessments, attention, policy):
     apply_aisle_dispatch(sorted(candidates,key=key),reserve,record)
     if any(record.state=='候选' for record in account.values()):
         raise ArithmeticError('派发工位未明确')
-    status_order={'已分派':0,'暂停':1,'候补':2,'人工判读':3,'观察':4}
+    status_order={'已分派':0,'暂停':1,'待核':2,'候补':3,'人工判读':4,'观察':5}
     handoff=tuple(sorted(account.values(),key=lambda item:(status_order[item.state],-item.priority,item.key)))
     return Plan(handoff,policy.capacity,slots,tuple(sorted(spent.items())))
 
 
-def plan_jobs(assessments, attention, capacity, mode='balanced'):
-    return allocate(assessments, frozenset(attention), Policy.select(capacity, mode))
+def plan_jobs(assessments, attention, capacity, mode='balanced', holds=None, *, review_holds=None,
+              pending=None, pending_review=None, review_pending=None):
+    holds = holds if holds is not None else review_holds
+    holds = holds if holds is not None else pending
+    holds = holds if holds is not None else pending_review
+    holds = holds if holds is not None else review_pending
+    return allocate(assessments, frozenset(attention), Policy.select(capacity, mode), holds)
 
 
 def action_evidence(plan):

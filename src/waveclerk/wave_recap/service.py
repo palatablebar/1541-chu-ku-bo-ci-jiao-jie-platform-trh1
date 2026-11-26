@@ -90,6 +90,38 @@ def sign_field_evidence(rows, allocation):
     return {'工位使用':spent, '执行业务单':document_control(rows)}
 
 
+def handoff_voucher_rows(rows, allocation, review_orders=()):
+    """Order-level export lines used to reconcile the shift voucher."""
+    review_by_key = {item['key']: item for item in review_orders}
+    job_by_key = {job.key: job for job in allocation.jobs}
+    vouchers = []
+    used = 0
+    for row in sorted(rows, key=lambda item: item['key']):
+        job = job_by_key.get(row['key'])
+        if job is None or job.state != row['state'] or job.cost != row['cost']:
+            raise ArithmeticError('交接凭证与处置方案逐单核对不符')
+        charged = row['cost'] if row['state'] == '已分派' else 0
+        used += charged
+        review = review_by_key.get(row['key'])
+        vouchers.append({
+            '单号': row['key'],
+            '作业区': row['zone'],
+            '处置': row['state'],
+            '原因码': row['reason'],
+            '估计': row['estimate'],
+            '区间': row['interval'],
+            '工位用量': row['cost'],
+            '已占额度': charged,
+            '缺测字段': '、'.join(row['unmeasured']) or None,
+            '缺测复核单': review['review_id'] if review else None,
+            '复核结论': review['复核状态'] if review else None,
+            '对账': '一致',
+        })
+    if used != allocation.capacity - allocation.balance:
+        raise ArithmeticError('交接凭证逐单额度合计不符')
+    return vouchers
+
+
 def intervention_summary(rows):
     actions = {}
     for record in rows:
@@ -103,3 +135,9 @@ def intervention_summary(rows):
     return [{'单项安排': key, '可比较单量': attempts, '超出拟合域': outlier,
              '总用量': units, '平均预测变化': round(delta/attempts,4)}
             for key,(attempts,outlier,units,delta) in sorted(actions.items())]
+
+
+# Verb aliases for order-level handoff reconciliation.
+reconcile_handoff = handoff_voucher_rows
+handoff_voucher = handoff_voucher_rows
+reconcile_orders = handoff_voucher_rows
